@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package emobility.v1;
+
+// Geldbetrag nach dem Vorbild von google.type.Money.
+// Bewusst KEIN float/double: Preise müssen exakt sein (0.1 + 0.2 != 0.3).
+// Betrag = units + nanos / 1e9, z. B. 0,59 EUR -> units = 0, nanos = 590000000.
+message Money {
+  string currency_code = 1;  // ISO 4217, z. B. "EUR"
+  int64 units = 2;           // ganze Einheiten
+  int32 nanos = 3;           // Nachkommaanteil in 1e-9 Einheiten, gleiches Vorzeichen wie units
+}

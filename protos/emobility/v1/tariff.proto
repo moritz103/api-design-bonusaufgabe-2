@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package emobility.v1;
+
+import "google/protobuf/timestamp.proto";
+import "emobility/v1/common.proto";
+import "emobility/v1/charge_point.proto";
+
+enum TariffType {
+  TARIFF_TYPE_UNSPECIFIED = 0;
+  TARIFF_TYPE_AC_STANDARD = 1;  // AC bis 22 kW
+  TARIFF_TYPE_DC_FAST = 2;      // DC 50 – 149 kW
+  TARIFF_TYPE_DC_HPC = 3;       // High Power Charging ab 150 kW
+}
+
+// Ein konkreter, zu einem Zeitpunkt berechneter Tarif.
+// tariff_id ist versioniert ("dc-fast@v2"), damit nachvollziehbar bleibt,
+// welche Tarifversion einem Ladevorgang zugeordnet wurde, auch wenn sich
+// der Tarif später im Betrieb ändert.
+message Tariff {
+  string tariff_id = 1;
+  TariffType tariff_type = 2;
+  Money price_per_kwh = 3;
+  Money blocking_fee_per_minute = 4;
+  uint32 blocking_fee_after_minutes = 5;
+  google.protobuf.Timestamp valid_from = 6;
+  google.protobuf.Timestamp quoted_at = 7;
+}
+
+message CalculateTariffRequest {
+  string charge_point_id = 1;
+  ConnectorType connector_type = 2;
+  uint32 max_power_w = 3;
+  string customer_id = 4;  // optional, für kundenspezifische Konditionen
+}
+
+// Tarifänderung im laufenden Betrieb (Admin-Operation).
+message UpdateTariffRequest {
+  TariffType tariff_type = 1;
+  Money price_per_kwh = 2;
+}
+
+service TariffService {
+  rpc CalculateTariff(CalculateTariffRequest) returns (Tariff);
+  rpc UpdateTariff(UpdateTariffRequest) returns (Tariff);
+}

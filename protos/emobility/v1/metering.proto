@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package emobility.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Ein einzelner Messwert während eines Ladevorgangs.
+// Physikalische Messgrößen dürfen Fließkomma sein (Messungenauigkeit > Rundungsfehler);
+// der Energiezähler ist wie bei echten Zählern ein ganzzahliger, kumulativer Wh-Wert.
+message MeterValue {
+  string session_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  uint64 energy_wh = 3;                // kumulativ seit Start, darf nicht sinken
+  uint32 power_w = 4;                  // aktuelle Ladeleistung
+  double temperature_celsius = 5;      // Steckertemperatur
+  uint32 state_of_charge_percent = 6;  // Akkustand 0..100 (0 = unbekannt)
+  string charge_point_id = 7;
+}
+
+message ReportMeterValuesResponse {
+  string session_id = 1;
+  uint32 accepted_count = 2;
+  uint64 energy_wh = 3;  // letzter Zählerstand
+}
+
+message StreamMeterValuesRequest {
+  string session_id = 1;
+  bool include_history = 2;  // bereits vorhandene Werte zuerst senden
+}
+
+message GetMeterSummaryRequest {
+  string session_id = 1;
+}
+
+message MeterSummary {
+  string session_id = 1;
+  uint32 value_count = 2;
+  uint64 energy_wh = 3;
+  uint32 max_power_w = 4;
+  double max_temperature_celsius = 5;
+  google.protobuf.Timestamp first_timestamp = 6;
+  google.protobuf.Timestamp last_timestamp = 7;
+  bool completed = 8;  // Ladesäule hat Übertragung abgeschlossen
+}
+
+service MeteringService {
+  // Client Streaming: die Ladesäule lädt fortlaufend Messwerte hoch,
+  // am Ende gibt es eine einzige Quittung.
+  rpc ReportMeterValues(stream MeterValue) returns (ReportMeterValuesResponse);
+
+  // Server Streaming: ein Consumer abonniert die Messwerte eines Ladevorgangs live.
+  rpc StreamMeterValues(StreamMeterValuesRequest) returns (stream MeterValue);
+
+  // Unary: Zusammenfassung (z. B. für die Abrechnung beim Beenden).
+  rpc GetMeterSummary(GetMeterSummaryRequest) returns (MeterSummary);
+}

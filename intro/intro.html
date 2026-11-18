@@ -1,0 +1,621 @@
+<!doctype html>
+<html>
+<head>
+    <title>Beschreibung Abgabe Bonusaufgabe 2</title>
+    <meta charset="utf-8">
+    <style>
+      body { font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 16px; line-height: 1.5; color: #222; }
+      table { border-collapse: collapse; margin: 1em 0; }
+      th, td { border: 1px solid #ccc; padding: 4px 8px; vertical-align: top; text-align: left; }
+      th { background: #f2f2f2; }
+      pre { background: #f6f8fa; padding: 10px; overflow-x: auto; }
+      code { font-family: Menlo, Consolas, monospace; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+<h1>Bonusaufgabe 2 – Verteiltes Lademanagement mit gRPC und Protocol Buffers</h1>
+<p>API-Design und Systemintegration, WS 2026/27. Vier Python-Services kommunizieren über gRPC, ihre Verträge sind mit Protocol Buffers definiert.</p>
+<ul>
+<li>Entwurfsentscheidungen und Begründungen: <a href="ENTWURF.md"><code>ENTWURF.md</code></a></li>
+<li>Resilienztests: <a href="scenarios.md"><code>scenarios.md</code></a></li>
+</ul>
+<h2>Setup</h2>
+<pre><code class="language-bash">python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+pip install -r requirements.txt
+python -m tools.gen_protos      # optional – die generierten Stubs sind eingecheckt
+</code></pre>
+<h2>Start (je ein Terminal, im Projektverzeichnis)</h2>
+<pre><code class="language-bash">python -m services.charge_point_service      # :50051
+python -m services.charging_session_service  # :50052
+python -m services.tariff_service            # :50053   (--delay 3 für den Deadline-Test)
+python -m services.metering_service          # :50054
+</code></pre>
+<h2>Consumer</h2>
+<pre><code class="language-bash">python client.py demo                        # Happy Path: anlegen -&gt; Messwerte live -&gt; beenden
+python client.py points                      # Ladesäulen und Belegung
+python client.py create cp-001 --id-tag RFID-4711 --customer-id K-100
+python client.py get &lt;session_id&gt;
+python client.py list --page-size 2          # Pagination über alle Seiten
+python client.py tariff &lt;session_id&gt;         # Tarif neu ermitteln und zuordnen
+python client.py set-tariff DC_HPC 0.79      # Tarifänderung im Betrieb
+python client.py watch &lt;session_id&gt;          # Server Streaming
+python simulator.py &lt;session_id&gt; --cp cp-001 # Ladesäule: Client Streaming
+python client.py stop &lt;session_id&gt;           # beenden + abrechnen
+python legacy_client.py                      # v1-Consumer gegen v2-Provider (API-Evolution)
+python -m tools.run_scenarios                # alle Resilienztests automatisch
+</code></pre>
+<p>Ports, Adressen und Deadlines lassen sich per Umgebungsvariable ändern (<code>common/config.py</code>), z. B. <code>TARIFF_DEADLINE_S=0.5</code>.</p>
+<h2>Struktur</h2>
+<table>
+<thead>
+<tr>
+<th>Pfad</th>
+<th>Inhalt</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>protos/emobility/v1/*.proto</code></td>
+<td>API-Verträge (aktuell, v2 von <code>charging_session.proto</code>)</td>
+</tr>
+<tr>
+<td><code>protos_legacy/emobility/v1/charging_session.proto</code></td>
+<td>ursprüngliche Version 1 (eingefroren)</td>
+</tr>
+<tr>
+<td><code>emobility/v1/</code>, <code>legacy_gen/</code></td>
+<td>generierte Stubs</td>
+</tr>
+<tr>
+<td><code>services/charging_session_service.py</code></td>
+<td>Orchestrator: Doppelrolle, Deadlines, Fehlerübersetzung, Kompensation</td>
+</tr>
+<tr>
+<td><code>services/charge_point_service.py</code></td>
+<td>Ladesäulen, Reserve/Release (idempotent)</td>
+</tr>
+<tr>
+<td><code>services/tariff_service.py</code></td>
+<td>Tarifberechnung, Tarifänderung, <code>--delay</code></td>
+</tr>
+<tr>
+<td><code>services/metering_service.py</code></td>
+<td>Client und Server Streaming, Validierung</td>
+</tr>
+<tr>
+<td><code>common/grpc_util.py</code></td>
+<td>Metadata-Interceptor, Deadline-Propagation, Money/Timestamp-Helfer</td>
+</tr>
+<tr>
+<td><code>client.py</code></td>
+<td>CLI-Consumer mit zentraler <code>RpcError</code>-Behandlung und Stream-Wiederverbindung</td>
+</tr>
+<tr>
+<td><code>simulator.py</code></td>
+<td>Ladesäulen-Simulator (Client Streaming)</td>
+</tr>
+<tr>
+<td><code>tools/run_scenarios.py</code></td>
+<td>reproduzierbare Fehlerszenarien</td>
+</tr>
+</tbody>
+</table>
+<h2>RPC-Muster im Überblick</h2>
+<table>
+<thead>
+<tr>
+<th>Muster</th>
+<th>RPC</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unary</td>
+<td>alle RPCs von ChargingSession-, ChargePoint- und TariffService, <code>GetMeterSummary</code></td>
+</tr>
+<tr>
+<td>Client Streaming</td>
+<td><code>MeteringService.ReportMeterValues</code></td>
+</tr>
+<tr>
+<td>Server Streaming</td>
+<td><code>MeteringService.StreamMeterValues</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h1>Entwurfsentscheidungen – Verteiltes Lademanagement mit gRPC</h1>
+<h2>1. Architektur und Servicegrenzen</h2>
+<pre><code>                 CreateChargingSession / Get / List /
+                 CalculateSessionTariff / StopChargingSession        (Unary)
+  CLI-Consumer ───────────────────────────────────────────────▶ ChargingSessionService :50052
+  (client.py)                                                    │   Provider  ▲   Consumer ▼
+      │                                                          │
+      │ StreamMeterValues (Server Streaming)        ReserveChargePoint / ReleaseChargePoint /
+      ▼                                             GetChargePoint (Unary, Deadline 2,0 s)
+  MeteringService :50054 ◀── GetMeterSummary ──────────┤──────────────▶ ChargePointService :50051
+      ▲                     (Unary, Deadline 2,0 s)     │
+      │ ReportMeterValues                               └── CalculateTariff (Unary, Deadline 1,5 s)
+      │ (Client Streaming)                                               ▼
+  Ladesäule (simulator.py)                                       TariffService :50053
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>Verantwortung (fachlicher Kontext)</th>
+<th>Daten</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>ChargePointService</strong></td>
+<td>Stammdaten und Belegungszustand der Ladesäulen, Reservieren/Freigeben</td>
+<td>Ladesäulen</td>
+</tr>
+<tr>
+<td><strong>ChargingSessionService</strong></td>
+<td>Lebenszyklus eines Ladevorgangs (Orchestrator): anlegen, Tarif zuordnen, beenden und abrechnen</td>
+<td>Ladevorgänge</td>
+</tr>
+<tr>
+<td><strong>TariffService</strong></td>
+<td>Preisbildung, Tarife ändern sich im Betrieb (<code>UpdateTariff</code>)</td>
+<td>Tariftabelle mit Version</td>
+</tr>
+<tr>
+<td><strong>MeteringService</strong></td>
+<td>Messwerte annehmen, validieren, live verteilen, zusammenfassen</td>
+<td>Messreihen je Session</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Begründung der Schnitte:</strong>
+- Jeder Service besitzt genau seine Daten (<em>Single Source of Truth</em>). Nur der ChargePointService ändert den Belegungszustand einer Säule. Damit ist die Doppelbelegung an einer einzigen Stelle (unter einem Lock) ausgeschlossen.
+- Tarife ändern sich unabhängig vom Ladevorgang und haben andere Stakeholder (Pricing). Der TariffService kann deshalb ohne Änderung des Session-Vertrags weiterentwickelt werden.
+- Messwerte haben ein ganz anderes Lastprofil: Es fallen viele kleine Nachrichten in Echtzeit an, und zwar über Streams. Der MeteringService trennt dieses Profil von der transaktionalen Session-Verwaltung. Fällt Metering aus, können Ladevorgänge trotzdem weiter angelegt werden.
+- <strong>Doppelrolle:</strong> Der ChargingSessionService ist Provider für den CLI-Consumer und gleichzeitig Consumer von drei Services. <code>CreateChargingSession</code> erfordert zwingend die Kommunikation mit ChargePoint und Tariff.
+- <em>Alternative:</em> Ein einziger Monolith wäre einfacher, böte aber weder unabhängige Skalierung (Metering) noch eine Fehlerisolierung. Eine Choreografie über Events statt eines Orchestrators würde den Ablauf „Reservieren → Tarif → Start“ schwer nachvollziehbar machen. Weil jeder Schritt synchron auf das Ergebnis des vorherigen angewiesen ist, passt RPC hier besser.</p>
+<p><strong>Ablauf <code>CreateChargingSession</code></strong> (<code>services/charging_session_service.py</code>):
+1. Validierung (<code>charge_point_id</code>, <code>id_tag</code>), Session-ID vergeben (<code>cs-…</code>, Status <code>PENDING</code>)
+2. <code>ReserveChargePoint</code>: Fehler werden übersetzt (siehe 2.4); noch nichts zu kompensieren
+3. <code>CalculateTariff</code> mit <strong>Deadline 1,5 s</strong>. Bei einem Fehler folgt die <strong>Kompensation</strong> <code>ReleaseChargePoint</code>, die Session wird als <code>FAILED</code> gespeichert und der Fehler geht an den Consumer
+4. Tarif zuordnen → <code>ACTIVE</code></p>
+<h2>2.1 API-Vertrag ChargingSessionService</h2>
+<p>Datei: <code>protos/emobility/v1/charging_session.proto</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Entscheidung</th>
+<th>Begründung</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Paket <code>emobility.v1</code></td>
+<td>Versionierung im Paketnamen: Ein inkompatibler Bruch hieße <code>v2</code>. Kompatible Änderungen bleiben in <code>v1</code> (siehe 2.6).</td>
+</tr>
+<tr>
+<td><code>session_id</code> als <code>string</code>, vom <strong>Provider</strong> vergeben (<code>cs-&lt;hex&gt;</code>)</td>
+<td>Opake ID: Der Consumer darf keine Struktur annehmen, und das Format kann später zu einer UUID oder einer DB-ID werden. So gibt es keine Kollisionen durch Consumer-IDs.</td>
+</tr>
+<tr>
+<td>Enum <code>ChargingSessionStatus</code> mit <code>…_UNSPECIFIED = 0</code></td>
+<td>Der proto3-Default 0 bedeutet „nicht gesetzt“ und ist nie ein gültiger fachlicher Zustand. Präfix je Wert, weil Enum-Werte in Protobuf im Paket-Scope liegen.</td>
+</tr>
+<tr>
+<td>Zustände <code>PENDING → ACTIVE → COMPLETED</code>, <code>FAILED</code></td>
+<td>Bilden den Ablauf mit zwei Downstream-Aufrufen ab. <code>FAILED</code> hält fehlgeschlagene Starts nachvollziehbar fest.</td>
+</tr>
+<tr>
+<td><code>Tariff tariff = 4</code> (eingebettete Message)</td>
+<td>Ordnet den berechneten Tarif zu. Gespeichert wird eine <strong>Kopie</strong> des Tarifs (mit versionierter <code>tariff_id</code>), damit spätere Tarifänderungen eine laufende Abrechnung nicht verändern.</td>
+</tr>
+<tr>
+<td>Preise als <code>Money {currency_code, units, nanos}</code></td>
+<td><strong>Kein float/double</strong>: Binäre Fließkommazahlen können 0,59 € nicht exakt darstellen. Das Muster stammt von <code>google.type.Money</code>.</td>
+</tr>
+<tr>
+<td>Leistung <code>uint32 max_power_w</code>, Energie <code>uint64 energy_wh</code></td>
+<td>Ganzzahlige SI-Basiseinheiten: eindeutig, ohne Rundungsfehler, der Wertebereich reicht aus. Die Einheit steht im Feldnamen.</td>
+</tr>
+<tr>
+<td>Zeitpunkte als <code>google.protobuf.Timestamp</code></td>
+<td>Standardtyp, zeitzonenneutral (UTC), in allen Sprachen unterstützt.</td>
+</tr>
+<tr>
+<td>Eigene Request/Response-Messages je RPC</td>
+<td>Jede Operation kann unabhängig um Felder erweitert werden, ohne andere RPCs zu beeinflussen (AIP-Stil).</td>
+</tr>
+<tr>
+<td><code>Create</code>/<code>Get</code>/<code>Stop</code> geben die Ressource <code>ChargingSession</code> zurück</td>
+<td>Der Consumer erhält den vollständigen Zustand inklusive vergebener ID und Tarif und braucht keinen zweiten Aufruf.</td>
+</tr>
+<tr>
+<td><strong>Pagination</strong> <code>page_size</code> + opaker <code>page_token</code> → <code>next_page_token</code></td>
+<td>Cursor-basiert statt Seitennummer. Das Token ist Base64-kodiert und für den Consumer bedeutungslos, die interne Umsetzung (Offset, später DB-Cursor) kann sich ändern. Default 10, maximal 100. Ein leerer <code>next_page_token</code> markiert die letzte Seite.</td>
+</tr>
+<tr>
+<td><code>CalculateSessionTariff(session_id) → Tariff</code></td>
+<td>„Tarif für einen Ladevorgang ermitteln“: Der aktuell gültige Tarif wird beim TariffService erfragt und der Session zugeordnet (z. B. nach <code>UpdateTariff</code>). Für <code>COMPLETED</code>/<code>FAILED</code> gilt <code>FAILED_PRECONDITION</code>.</td>
+</tr>
+<tr>
+<td>Namen</td>
+<td>Methoden nach <code>Verb + Ressource</code> (<code>CreateChargingSession</code>), Felder in <code>snake_case</code>, Services im Singular. Das entspricht den Google API Design Guidelines.</td>
+</tr>
+<tr>
+<td>Feldnummern</td>
+<td>1–15 (ein Byte Tag) für häufige Felder, keine Lücken außer bei bewusst reservierten Nummern.</td>
+</tr>
+</tbody>
+</table>
+<h2>2.2 ChargePointService</h2>
+<p><code>ChargePoint</code>: <code>charge_point_id</code>, <code>station_id</code>, <code>display_name</code>, <code>connector_type</code> (Enum), <code>max_power_w</code>, <code>status</code>, <code>current_session_id</code>.</p>
+<ul>
+<li><strong>Verfügbarkeitsstatus</strong> <code>AVAILABLE</code>, <code>OCCUPIED</code>, <code>OUT_OF_ORDER</code>. Nur <code>AVAILABLE</code> ist reservierbar.</li>
+<li><strong>Reserve-/Belegungssemantik:</strong> <code>ReserveChargePoint(charge_point_id, session_id)</code> bindet die Säule exklusiv an genau einen Ladevorgang.</li>
+<li><em>Idempotent:</em> Ein wiederholter Aufruf mit derselben <code>session_id</code> (z. B. Retry nach Timeout) ist erfolgreich und keine Doppelbelegung.</li>
+<li><code>ReleaseChargePoint</code> darf nur die belegende Session aufrufen, sonst gibt es <code>PERMISSION_DENIED</code>. Ist die Säule bereits frei, ist der Aufruf ebenfalls idempotent erfolgreich.</li>
+<li><code>connector_type</code> und <code>max_power_w</code> braucht der TariffService zur Preisbildung (AC vs. DC vs. HPC).</li>
+</ul>
+<h2>2.3 RPC-Muster, Streaming und Paradigmen-Abgrenzung</h2>
+<table>
+<thead>
+<tr>
+<th>RPC</th>
+<th>Muster</th>
+<th>Begründung</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Create/Get/List/Stop, Reserve/Release, CalculateTariff, GetMeterSummary</td>
+<td><strong>Unary</strong></td>
+<td>Klassisches Request/Response mit genau einer Antwort. Leicht mit Deadlines und Status Codes abzusichern.</td>
+</tr>
+<tr>
+<td><code>ReportMeterValues(stream MeterValue) → ReportMeterValuesResponse</code></td>
+<td><strong>Client Streaming</strong></td>
+<td>Die Ladesäule schickt fortlaufend viele Messwerte über <em>eine</em> HTTP/2-Verbindung, ohne Overhead pro Wert. Am Ende gibt es eine Quittung (Anzahl, Zählerstand). Ist ein Wert ungültig, wird der ganze Stream mit <code>INVALID_ARGUMENT</code> abgebrochen.</td>
+</tr>
+<tr>
+<td><code>StreamMeterValues(session_id) → stream MeterValue</code></td>
+<td><strong>Server Streaming</strong></td>
+<td>Der Consumer abonniert die Messwerte eines Ladevorgangs live, statt zu pollen. Der Stream endet, wenn die Ladesäule ihre Übertragung abschließt.</td>
+</tr>
+<tr>
+<td>Bidirectional Streaming</td>
+<td><em>nicht verwendet</em></td>
+<td>Wäre sinnvoll für eine dauerhafte Steuerverbindung zur Ladesäule (Messwerte hoch, Steuerbefehle wie „Leistung drosseln“ runter, vergleichbar mit OCPP). Für unsere Anwendungsfälle ist keine Gegenrichtung im selben Stream nötig. Das erhöht nur die Komplexität (Flusskontrolle, Fehlerbehandlung).</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Warum gRPC-Streaming für <code>StreamMeterValues</code>?</strong>
+- Es gibt <em>einen</em> bekannten Consumer pro Stream, der gezielt <em>einen</em> Ladevorgang beobachtet: eine Punkt-zu-Punkt-Beziehung mit fachlichem Request (<code>session_id</code>).
+- Der Stream hat eine klare Lebensdauer (Ladevorgang) und typisierte Nachrichten aus demselben Vertrag. HTTP/2-Flusskontrolle sorgt für Backpressure.
+- Fehler kommen direkt beim Consumer als Status Code an (<code>UNAVAILABLE</code> → Wiederverbindung), und es ist keine zusätzliche Infrastruktur nötig.</p>
+<p><strong>Wann eher Broker/Messaging (z. B. RabbitMQ, Kafka)?</strong>
+- <strong>Event Broadcasting an viele unabhängige Consumer</strong>: Wenn Abrechnung, Monitoring, Lastmanagement und Data-Warehouse jeden Messwert erhalten sollen, müsste der MeteringService bei gRPC jeden Consumer kennen und bedienen. Ein Broker entkoppelt Producer und Consumer (Publish/Subscribe).
+- <strong>Zeitliche Entkopplung und Zustellgarantie</strong>: Ein Consumer, der gerade offline ist, soll Werte später nachholen (persistente Queues, Retention, Replay). Bei gRPC gehen Werte während einer Unterbrechung verloren. Im Prototyp hält der Server sie nur im Speicher (siehe Szenario 6).
+- <strong>Lastspitzen puffern</strong> und Consumer unabhängig skalieren (Consumer Groups).
+- Fazit: gRPC passt für gezielte Abfragen und Abos mit Rückkanal und Fehlercode. Ein Broker passt für fachliche Ereignisse („Ladevorgang beendet“), die viele unbekannte Abnehmer interessieren.</p>
+<h2>2.4 Fehlerbehandlung</h2>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Entsteht in</th>
+<th>Status Code</th>
+<th>Begründung</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ladevorgang existiert nicht</td>
+<td>ChargingSessionService</td>
+<td><code>NOT_FOUND</code></td>
+<td>Ressource fehlt</td>
+</tr>
+<tr>
+<td>Ladesäule existiert nicht</td>
+<td>ChargePointService → durchgereicht</td>
+<td><code>NOT_FOUND</code></td>
+<td>Fachlicher Fehler, vom Consumer verursacht (falsche ID), also gleiche Bedeutung für ihn</td>
+</tr>
+<tr>
+<td>Ladesäule belegt / gesperrt</td>
+<td>ChargePointService → durchgereicht</td>
+<td><code>FAILED_PRECONDITION</code></td>
+<td>Request ist gültig, aber der Systemzustand erlaubt ihn nicht. Ein Retry ohne Zustandsänderung ist zwecklos. Nicht <code>ALREADY_EXISTS</code> (die Session existiert ja nicht) und nicht <code>UNAVAILABLE</code> (das würde Retry suggerieren).</td>
+</tr>
+<tr>
+<td>Ungültige Daten (leeres <code>id_tag</code>, <code>page_size &lt; 0</code>, ungültiger <code>page_token</code>, sinkender Zählerstand, Temperatur außerhalb [-40, 120] °C)</td>
+<td>jeweiliger Provider</td>
+<td><code>INVALID_ARGUMENT</code></td>
+<td>Unabhängig vom Systemzustand ungültig</td>
+</tr>
+<tr>
+<td>Fremde Session will Säule freigeben</td>
+<td>ChargePointService</td>
+<td><code>PERMISSION_DENIED</code></td>
+<td></td>
+</tr>
+<tr>
+<td>Downstream-Service nicht erreichbar</td>
+<td>ChargingSessionService</td>
+<td><strong><code>UNAVAILABLE</code></strong></td>
+<td>siehe unten</td>
+</tr>
+<tr>
+<td>Downstream-Service zu langsam</td>
+<td>ChargingSessionService</td>
+<td><code>DEADLINE_EXCEEDED</code></td>
+<td>siehe 2.5</td>
+</tr>
+<tr>
+<td>Sonstige unerwartete Downstream-Fehler</td>
+<td>ChargingSessionService</td>
+<td><code>INTERNAL</code></td>
+<td>Interna nicht nach außen geben</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Service-Ausfall (ChargePointService nicht erreichbar):</strong> Der ChargingSessionService erhält vom gRPC-Client <code>UNAVAILABLE</code> (Verbindung abgelehnt). Er gibt <strong><code>UNAVAILABLE</code></strong> mit eigener Fehlermeldung an den ursprünglichen Consumer zurück:
+- <code>UNAVAILABLE</code> bedeutet laut gRPC-Spezifikation „vorübergehend, Retry mit Backoff sinnvoll“. Genau das trifft zu: Der Request war korrekt, und nach dem Neustart des Services gelingt er (Szenario 4).
+- <code>INTERNAL</code> würde einen Bug im SessionService suggerieren und Retries verhindern. <code>FAILED_PRECONDITION</code> würde einen fachlichen Zustand behaupten, der nicht besteht.
+- Der Code wird <strong>nicht blind durchgereicht</strong>: Die zentrale Funktion <code>translate()</code> entscheidet je Code. Fachliche Fehler (<code>NOT_FOUND</code>, <code>FAILED_PRECONDITION</code>, <code>INVALID_ARGUMENT</code>) gehen durch, weil der Consumer sie verursacht hat. Technische Fehler werden mit einer eigenen Meldung („ChargePointService nicht erreichbar“) neu formuliert. Unbekannte Codes werden zu <code>INTERNAL</code>.
+- Konsistenz: Fällt der ChargePointService beim Reservieren aus, ist noch nichts belegt und es wird keine Session gespeichert. Fällt der Tarif aus, wird die Reservierung kompensiert.</p>
+<p><strong>Consumer</strong> (<code>client.py</code>, <code>handle_rpc_error</code>): fängt <code>grpc.RpcError</code> ab und wertet <code>err.code()</code>, <code>err.details()</code> und die Trailing Metadata (<code>x-session-id</code>) aus.
+- Er gibt je Code eine passende Handlungsempfehlung aus.
+- Exit-Code 2 kennzeichnet wiederholbare Fehler (<code>UNAVAILABLE</code>, <code>DEADLINE_EXCEEDED</code>), Exit-Code 1 kennzeichnet nicht wiederholbare Fehler.
+- <code>watch</code> verbindet sich bei <code>UNAVAILABLE</code> automatisch mit exponentiellem Backoff neu.</p>
+<h2>2.5 Deadlines und Metadaten</h2>
+<p><strong>Deadlines:</strong>
+- <strong>Wo:</strong> Im ChargingSessionService bei jedem Downstream-Aufruf über <code>timeout=</code> (<code>_call()</code>):
+  - TariffService 1,5 s (<em>Zeitbudget für den Preis</em>)
+  - ChargePointService 2,0 s
+  - MeteringService 2,0 s</p>
+<p>Der CLI-Consumer setzt selbst 5 s.
+- <strong>Deadline-Propagation:</strong> <code>budget()</code> nimmt das Minimum aus eigenem Budget und Restzeit des eingehenden Aufrufs (<code>context.time_remaining()</code>). Ein Downstream-Aufruf wartet also nie länger, als der ursprüngliche Consumer noch wartet.
+- <strong>Auswirkung der Überschreitung:</strong> Nach 1,5 s bricht gRPC den Tarifaufruf clientseitig mit <code>DEADLINE_EXCEEDED</code> ab, und der SessionService blockiert nicht weiter. Er gibt die reservierte Ladesäule wieder frei (Kompensation), speichert die Session als <code>FAILED</code> mit Grund und antwortet.
+- <strong>Status Code:</strong> Es entsteht <code>DEADLINE_EXCEEDED</code> im SessionService (als Client des TariffService). Weitergegeben wird <strong><code>DEADLINE_EXCEEDED</code></strong> mit der Meldung „Ladevorgang cs-… nicht gestartet: TariffService hat nicht innerhalb des Zeitbudgets geantwortet“. Der Consumer weiß damit, dass der Vorgang nicht gestartet wurde und ein Retry sinnvoll ist. Die Session-ID kommt per Trailing Metadata <code>x-session-id</code> mit.
+- <strong>Auswirkung auf den TariffService:</strong> Er erkennt per <code>context.is_active()</code>, dass der Aufrufer abgebrochen hat, und verwirft die Berechnung (Log „Aufrufer hat abgebrochen“). So wird keine Arbeit für eine Antwort verschwendet, die niemand mehr liest.
+- <code>StreamMeterValues</code> läuft bewusst <strong>ohne</strong> Deadline, weil seine Laufzeit der Dauer des Ladevorgangs entspricht.</p>
+<p><strong>Metadaten:</strong>
+- <code>x-correlation-id</code> wird vom Consumer pro Befehl erzeugt und vom SessionService bei <em>allen</em> Downstream-Aufrufen weitergegeben. Fehlt sie, erzeugt der Provider eine.
+- <code>x-client-id</code> ist der Aufrufer: <code>cli-consumer</code>, <code>charge-point-cp-001</code>, <code>legacy-app-v1</code>, <code>charging-session-service</code>.
+- Provider-Seite: Der <code>MetadataLoggingInterceptor</code> (<code>common/grpc_util.py</code>) liest die Werte bei jedem RPC aus und protokolliert sie. Alle Service-Logs eines Vorgangs lassen sich so über dieselbe ID verfolgen:
+  <code>charging-session [req-97493f04] &lt;- CreateChargingSession  (client=cli-consumer)
+  charge-point     [req-97493f04] &lt;- ReserveChargePoint  (client=charging-session-service)
+  tariff           [req-97493f04] &lt;- CalculateTariff  (client=charging-session-service)</code>
+- <strong>Warum Metadata statt Request-Feld?</strong> Correlation-ID und Client-ID sind <em>technische Querschnittsinformationen</em> und kein Teil des fachlichen Vertrags:
+  - Sie betreffen alle RPCs gleichermaßen und würden sonst in jeder Request-Message dupliziert.
+  - Sie werden von Infrastruktur ausgewertet (Interceptor, Tracing, Gateway, Auth) und nicht von der Fachlogik.
+  - Sie lassen sich ergänzen oder ändern, ohne einen <code>.proto</code>-Vertrag anzupassen.</p>
+<p>Dasselbe gilt für Authentifizierung (<code>authorization</code>-Header).</p>
+<h2>2.6 API-Evolution und Kompatibilität</h2>
+<p>Der Vertrag <code>charging_session.proto</code> wurde von <strong>Version 1</strong> (eingefroren in <code>protos_legacy/</code>) zu <strong>Version 2</strong> (<code>protos/</code>) weiterentwickelt.</p>
+<p><strong>Version 1 (ursprünglich):</strong></p>
+<pre><code class="language-proto">enum ChargingSessionStatus {
+  CHARGING_SESSION_STATUS_UNSPECIFIED = 0;
+  CHARGING_SESSION_STATUS_PENDING = 1;
+  CHARGING_SESSION_STATUS_ACTIVE = 2;
+  CHARGING_SESSION_STATUS_COMPLETED = 3;
+  CHARGING_SESSION_STATUS_FAILED = 4;
+}
+message ChargingSession {
+  ...
+  string vehicle_plate = 5;
+  ...
+  string failure_reason = 11;
+}
+message CreateChargingSessionRequest {
+  string charge_point_id = 1;
+  string id_tag = 2;
+  string vehicle_plate = 3;
+}
+</code></pre>
+<p><strong>Version 2 (weiterentwickelt):</strong></p>
+<pre><code class="language-proto">enum ChargingSessionStatus {
+  ...
+  CHARGING_SESSION_STATUS_FAILED = 4;
+  CHARGING_SESSION_STATUS_SUSPENDED = 5;   // (1) neuer Enum-Wert
+}
+message ChargingSession {
+  ...
+  reserved 5;                              // (2) Feld entfernt, Nummer + Name gesperrt
+  reserved &quot;vehicle_plate&quot;;
+  ...
+  string failure_reason = 11;
+  string customer_id = 12;                 // (3) neues Feld
+}
+message CreateChargingSessionRequest {
+  string charge_point_id = 1;
+  string id_tag = 2;
+  reserved 3;                              // (2) Feld entfernt
+  reserved &quot;vehicle_plate&quot;;
+  string customer_id = 4;                  // (3) Request erweitert
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Änderung</th>
+<th>Auswirkung auf bestehende Consumer</th>
+<th>Kompatibilität</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(1) Enum-Wert <code>SUSPENDED = 5</code></td>
+<td>Ein v1-Consumer kennt den Namen nicht. Python liefert den Rohwert 5, Java <code>UNRECOGNIZED</code>. Er muss mit unbekannten Werten rechnen (Default-Zweig).</td>
+<td>Neue Nummer, bestehende Nummern bleiben gleich. Der Wire-Format-kompatible Wert geht nicht verloren.</td>
+</tr>
+<tr>
+<td>(2) <code>vehicle_plate</code> entfernt (Datenschutz: Kennzeichen sind personenbezogen und fachlich nicht nötig)</td>
+<td>Ein v1-Consumer darf das Feld weiter senden. Der v2-Provider behandelt es als unbekanntes Feld und ignoriert es. In Antworten fehlt es, also liest v1 <code>""</code>.</td>
+<td><code>reserved 5</code> / <code>reserved 3</code> und der reservierte Name verhindern, dass ein späterer Entwickler die Nummer mit <strong>anderem Typ oder anderer Bedeutung</strong> wiederverwendet. Sonst würden alte Consumer Daten falsch interpretieren. protoc lehnt eine Wiederverwendung mit einem Fehler ab.</td>
+</tr>
+<tr>
+<td>(3) <code>customer_id</code> (Feld 12 bzw. 4)</td>
+<td>Keine: Alte Consumer senden es nicht (Default <code>""</code> = „kein Kunde“) und ignorieren es in Antworten.</td>
+<td>Neue, nie benutzte Feldnummer. Das Feld ist optional, und der Default hat eine sinnvolle Bedeutung.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Nachweis:</strong> <code>python legacy_client.py</code> nutzt die <strong>v1-Stubs</strong> (<code>legacy_gen/</code>) gegen den v2-Provider. Er sendet <code>vehicle_plate</code>, legt erfolgreich einen Ladevorgang an und beendet ihn wieder. Inkompatibel (und deshalb vermieden) wären: Feldnummer oder Feldtyp ändern, ein Feld umbenennen und dabei die Nummer wiederverwenden, ein Pflicht-Semantik-Feld ohne sinnvollen Default hinzufügen, RPCs umbenennen. Solche Brüche bräuchten ein neues Paket <code>emobility.v2</code> parallel zu <code>v1</code>.</p>
+<h2>Grenzen und mögliche Verbesserungen</h2>
+<ul>
+<li>Datenhaltung nur im Speicher: Bei einem Neustart gehen Sessions bzw. Messwerte verloren (sichtbar in Szenario 6). Abhilfe wäre eine Datenbank oder ein Event-Log.</li>
+<li>Die Kompensation im Create-Ablauf ist eine einfache Saga ohne Persistenz. Ein Absturz zwischen Reserve und Release würde eine Säule blockieren. Abhilfe wäre eine Reservierung mit Ablaufzeit (TTL) im ChargePointService.</li>
+<li>Keine automatischen Retries im SessionService. Für idempotente Aufrufe (Reserve mit derselben <code>session_id</code>) wäre eine gRPC-Retry-Policy per Service Config möglich.</li>
+<li>Keine TLS/Authentifizierung (<code>insecure_channel</code>). In Produktion bräuchte es mTLS zwischen den Services und ein Token im <code>authorization</code>-Metadata.</li>
+<li>Die Blockiergebühr wird im Tarif geliefert, aber noch nicht abgerechnet.</li>
+</ul>
+<hr />
+<h1>Resilienztests (Abschnitt 2.7)</h1>
+<p>Alle Szenarien sind gezielt reproduzierbar und automatisiert:</p>
+<pre><code class="language-bash">python -m tools.run_scenarios          # alle 6 Szenarien, startet/stoppt die Services selbst
+python -m tools.run_scenarios 4 5      # nur Ausfall + Deadline
+</code></pre>
+<p>Die Logs der Services liegen danach unter <code>logs/</code>. Über die Correlation-ID lässt sich jeder Aufruf durch alle Services verfolgen. Fehler werden durch <strong>Fehlerinjektion</strong> ausgelöst (Service beenden, <code>--delay</code>, ungültige Eingaben) und nicht durch Zufall.</p>
+<p>Übersicht:</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Szenario</th>
+<th>Code beim Consumer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Nicht existierende Session / Ladesäule</td>
+<td><code>NOT_FOUND</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Fachlich ungültige Daten</td>
+<td><code>INVALID_ARGUMENT</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Ladesäule belegt / gesperrt</td>
+<td><code>FAILED_PRECONDITION</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>Ausfall ChargePointService</strong></td>
+<td><code>UNAVAILABLE</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>TariffService überschreitet Deadline</strong></td>
+<td><code>DEADLINE_EXCEEDED</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td>Streaming-Verbindung unterbrochen</td>
+<td><code>UNAVAILABLE</code> → Wiederverbindung</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>Szenario 1 – Nicht existierende session_id / Ladesäule</h2>
+<p><code>python client.py get cs-0000000000</code> und <code>python client.py create cp-999</code></p>
+<ol>
+<li><strong>Auslöser:</strong> Der Consumer fragt eine Session-ID bzw. eine Ladesäule an, die es nicht gibt.</li>
+<li><strong>Entstehung:</strong></li>
+<li>Session: im ChargingSessionService (<code>_get_or_abort</code>)</li>
+<li>Ladesäule: im ChargePointService bei <code>ReserveChargePoint</code></li>
+<li><strong>Erzeugter Code:</strong> <code>NOT_FOUND</code> in beiden Fällen.</li>
+<li><strong>Code beim Consumer:</strong> <code>NOT_FOUND</code>. Der SessionService reicht den fachlichen Fehler des ChargePointService bewusst durch, weil der Consumer ihn mit der falschen ID verursacht hat.</li>
+<li><strong>Reaktion des Consumers:</strong> Er gibt Fehlermeldung, Correlation-ID und den Hinweis „ID prüfen“ aus. Exit-Code 1, kein Retry.</li>
+<li><strong>Auswirkung auf andere Services:</strong> keine. Es wird keine Session gespeichert und nichts reserviert, und der TariffService wird gar nicht erst aufgerufen.</li>
+<li><strong>Weiterarbeit:</strong> ja, sofort. Der nächste gültige Aufruf funktioniert.</li>
+</ol>
+<h2>Szenario 2 – Fachlich ungültige Daten</h2>
+<ul>
+<li><code>python client.py create cp-002 --id-tag ""</code></li>
+<li><code>python client.py list --page-size -5</code></li>
+<li>
+<p><code>python simulator.py &lt;session&gt; --invalid</code> (Zählerstand sinkt im Stream)</p>
+</li>
+<li>
+<p><strong>Auslöser:</strong> Die Requests verletzen die fachlichen Regeln des Datenmodells:</p>
+</li>
+<li><code>id_tag</code> muss 1–64 Zeichen lang sein.</li>
+<li><code>page_size</code> darf nicht negativ sein.</li>
+<li><code>energy_wh</code> ist kumulativ und darf nicht sinken.</li>
+<li><strong>Entstehung:</strong></li>
+<li>ChargingSessionService (Validierung vor jedem Downstream-Aufruf)</li>
+<li>MeteringService (<code>_validate</code> im Client-Stream)</li>
+<li><strong>Erzeugter Code:</strong> <code>INVALID_ARGUMENT</code>.</li>
+<li><strong>Code beim Consumer:</strong> <code>INVALID_ARGUMENT</code>. Bei <code>ReportMeterValues</code> bricht der Server den gesamten Client-Stream ab.</li>
+<li><strong>Reaktion des Consumers:</strong> „Eingabe korrigieren – Wiederholung ohne Änderung ist zwecklos.“ Kein Retry. Der Simulator meldet den Abbruch.</li>
+<li><strong>Auswirkung auf andere Services:</strong> keine. Weil früh validiert wird (<em>fail fast</em>), werden ChargePoint- und TariffService nicht belastet. Die Messwerte, die vor dem ungültigen Wert gültig waren, bleiben im Metering gespeichert.</li>
+<li><strong>Weiterarbeit:</strong> ja. Andere Streams und Sessions sind nicht betroffen.</li>
+</ul>
+<h2>Szenario 3 – Ladesäule nicht reservierbar (belegt / gesperrt)</h2>
+<p>Zweimal <code>python client.py create cp-004</code>, außerdem <code>python client.py create cp-003</code> (cp-003 ist <code>OUT_OF_ORDER</code>).</p>
+<ol>
+<li><strong>Auslöser:</strong> Die Säule ist bereits einer anderen Session zugeordnet bzw. gesperrt.</li>
+<li><strong>Entstehung:</strong> im ChargePointService (<code>ReserveChargePoint</code>, Prüfung unter Lock, daher keine Race Condition bei gleichzeitigen Anfragen).</li>
+<li><strong>Erzeugter Code:</strong> <code>FAILED_PRECONDITION</code>, mit Begründung „bereits belegt (Session …)“ bzw. „gesperrt“.</li>
+<li><strong>Code beim Consumer:</strong> <code>FAILED_PRECONDITION</code> (durchgereicht).</li>
+<li><strong>Reaktion des Consumers:</strong> „Andere Ladesäule wählen oder Zustand prüfen“. Kein blindes Retry.</li>
+<li><strong>Auswirkung auf andere Services:</strong> Die bestehende Belegung bleibt unverändert, und der TariffService wird nicht aufgerufen.</li>
+<li><strong>Weiterarbeit:</strong> ja. Nach <code>stop</code> der ersten Session ist cp-004 wieder reservierbar.</li>
+</ol>
+<h2>Szenario 4 – Ausfall des ChargePointService (Service-Ausfall)</h2>
+<p>ChargePointService beenden, dann <code>python client.py create cp-001</code>, dann den Service neu starten und den Befehl wiederholen.</p>
+<ol>
+<li><strong>Auslöser:</strong> Der ChargePointService-Prozess wird vor dem service-übergreifenden Aufruf beendet.</li>
+<li><strong>Entstehung:</strong> im ChargingSessionService, in seiner Rolle als <em>Client</em> des ChargePointService. Der gRPC-Kanal bekommt keine Verbindung.</li>
+<li><strong>Erzeugter Code:</strong> <code>UNAVAILABLE</code> (vom gRPC-Client-Stack im SessionService).</li>
+<li><strong>Code beim Consumer:</strong> <code>UNAVAILABLE</code> mit eigener Meldung „ChargePointService nicht erreichbar – bitte später erneut versuchen“. Begründung: Der Fehler ist vorübergehend, und ein Retry ist sinnvoll. Es ist weder ein Bug (<code>INTERNAL</code>) noch ein fachlicher Zustand (<code>FAILED_PRECONDITION</code>). Details in ENTWURF.md, Abschnitt 2.4.</li>
+<li><strong>Reaktion des Consumers:</strong> Hinweis „später erneut versuchen“, Exit-Code 2 (wiederholbar).</li>
+<li><strong>Auswirkung auf andere Services:</strong></li>
+<li>Es wird <em>keine</em> halbfertige Session gespeichert und nichts reserviert. Der Test prüft, dass es 0 aktive Sessions gibt.</li>
+<li>TariffService und Metering arbeiten unverändert weiter.</li>
+<li><code>get</code>/<code>list</code> des SessionService funktionieren weiterhin (partielle Verfügbarkeit).</li>
+<li><strong>Weiterarbeit:</strong> ja. Nach dem Neustart verbindet sich der gRPC-Kanal automatisch neu, und <code>create cp-001</code> gelingt.</li>
+</ol>
+<h2>Szenario 5 – TariffService überschreitet die Deadline</h2>
+<p>TariffService mit <code>--delay 3</code> starten (Antwort nach 3 s), das Zeitbudget im SessionService beträgt 1,5 s. Dann <code>python client.py create cp-001</code>.</p>
+<ol>
+<li><strong>Auslöser:</strong> Die Tarifberechnung dauert gezielt länger als die Deadline des Aufrufers.</li>
+<li><strong>Entstehung:</strong></li>
+<li>Die Deadline läuft im ChargingSessionService beim Aufruf <code>CalculateTariff(timeout=1.5)</code> ab.</li>
+<li>Der TariffService erkennt per <code>context.is_active()</code>, dass der Aufrufer abgebrochen hat, und verwirft die Berechnung.</li>
+<li><strong>Erzeugter Code:</strong> <code>DEADLINE_EXCEEDED</code> (clientseitig im SessionService, nach rund 1,5 s und nicht erst nach 3 s).</li>
+<li><strong>Code beim Consumer:</strong> <code>DEADLINE_EXCEEDED</code>, mit Meldung „Ladevorgang cs-… nicht gestartet: TariffService hat nicht innerhalb des Zeitbudgets geantwortet“. Die Session-ID kommt zusätzlich in der Trailing Metadata <code>x-session-id</code>.</li>
+<li><strong>Reaktion des Consumers:</strong> Er meldet „Vorgang wurde nicht gestartet, erneut versuchen“ und gibt die Session-ID aus. Exit-Code 2.</li>
+<li><strong>Auswirkung auf andere Services:</strong></li>
+<li><strong>Kompensation:</strong> Der SessionService gibt cp-001 per <code>ReleaseChargePoint</code> wieder frei. Der Test prüft, dass die Säule danach <code>AVAILABLE</code> ist.</li>
+<li>Die Session wird als <code>FAILED</code> mit Grund gespeichert und ist über <code>get</code> nachvollziehbar.</li>
+<li>Der TariffService bricht seine Arbeit ab.</li>
+<li><strong>Weiterarbeit:</strong> ja. Nach dem Neustart des TariffService ohne Verzögerung startet ein neuer Ladevorgang normal.</li>
+</ol>
+<h2>Szenario 6 – Streaming-Verbindung wird während der Übertragung unterbrochen</h2>
+<p><code>python client.py watch &lt;session&gt; --history</code> und <code>python simulator.py &lt;session&gt;</code> laufen. Der MeteringService wird beendet und neu gestartet, danach sendet die Säule erneut.</p>
+<ol>
+<li><strong>Auslöser:</strong> Der MeteringService fällt während zweier laufender Streams aus: Client-Stream der Säule und Server-Stream des Consumers.</li>
+<li><strong>Entstehung:</strong> auf der Transportebene (HTTP/2-Verbindung bricht ab). Erkannt wird der Fehler in beiden Clients.</li>
+<li><strong>Erzeugter Code:</strong> <code>UNAVAILABLE</code> („Socket closed“ bzw. „failed to connect“).</li>
+<li><strong>Code beim Consumer:</strong> <code>UNAVAILABLE</code> im Simulator (Client Streaming) und im <code>watch</code>-Consumer (Server Streaming).</li>
+<li><strong>Reaktion des Consumers:</strong></li>
+<li><code>watch</code> verbindet sich mit exponentiellem Backoff neu (1 s, 2 s, …, maximal 5 Versuche).</li>
+<li>Er abonniert erneut mit <code>include_history</code> und überspringt bereits angezeigte Werte anhand des Zeitstempels.</li>
+<li>Nach dem Neustart empfängt er wieder Werte, bis die Säule ihre Übertragung abschließt.</li>
+<li>Der Simulator meldet den Abbruch, und die Säule sendet mit fortgesetztem Zählerstand (<code>--start-wh</code>) neu.</li>
+<li><strong>Auswirkung auf andere Services:</strong></li>
+<li>Der Session- und der ChargePointService sind nicht betroffen, die Session bleibt <code>ACTIVE</code>.</li>
+<li>Die bis zum Ausfall im Speicher gehaltenen Messwerte sind verloren (In-Memory-Prototyp). <code>stop</code> rechnet nur die nach dem Neustart gemeldete Energie ab.</li>
+<li>Genau hier läge der Vorteil eines Brokers mit persistenter Queue bzw. einer Datenbank (siehe ENTWURF.md, Abschnitt 2.3).</li>
+<li>Fällt Metering beim <code>stop</code> aus, antwortet der SessionService mit <code>UNAVAILABLE</code> und lässt die Session <code>ACTIVE</code>, damit <code>stop</code> später wiederholt werden kann.</li>
+<li><strong>Weiterarbeit:</strong> ja. Neue Streams funktionieren sofort, und der Consumer erholt sich ohne manuellen Eingriff.</li>
+</ol>
+</body>
+</html>

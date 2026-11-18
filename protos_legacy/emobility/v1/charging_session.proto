@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package emobility.v1;
+
+import "google/protobuf/timestamp.proto";
+import "emobility/v1/common.proto";
+import "emobility/v1/tariff.proto";
+
+// URSPRÜNGLICHE Version 1 des Vertrags (eingefroren).
+// Wird nur für legacy_client.py generiert, um zu zeigen, dass ein alter
+// Consumer gegen den weiterentwickelten Provider (v2) weiter funktioniert.
+
+enum ChargingSessionStatus {
+  CHARGING_SESSION_STATUS_UNSPECIFIED = 0;
+  CHARGING_SESSION_STATUS_PENDING = 1;
+  CHARGING_SESSION_STATUS_ACTIVE = 2;
+  CHARGING_SESSION_STATUS_COMPLETED = 3;
+  CHARGING_SESSION_STATUS_FAILED = 4;
+}
+
+message ChargingSession {
+  string session_id = 1;
+  string charge_point_id = 2;
+  ChargingSessionStatus status = 3;
+  Tariff tariff = 4;
+  string vehicle_plate = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp ended_at = 7;
+  string id_tag = 8;
+  uint64 energy_delivered_wh = 9;
+  Money total_cost = 10;
+  string failure_reason = 11;
+}
+
+message CreateChargingSessionRequest {
+  string charge_point_id = 1;
+  string id_tag = 2;
+  string vehicle_plate = 3;
+}
+
+message GetChargingSessionRequest {
+  string session_id = 1;
+}
+
+message ListChargingSessionsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  ChargingSessionStatus status_filter = 3;
+}
+
+message ListChargingSessionsResponse {
+  repeated ChargingSession charging_sessions = 1;
+  string next_page_token = 2;
+  int32 total_size = 3;
+}
+
+message CalculateSessionTariffRequest {
+  string session_id = 1;
+}
+
+message StopChargingSessionRequest {
+  string session_id = 1;
+}
+
+service ChargingSessionService {
+  rpc CreateChargingSession(CreateChargingSessionRequest) returns (ChargingSession);
+  rpc GetChargingSession(GetChargingSessionRequest) returns (ChargingSession);
+  rpc ListChargingSessions(ListChargingSessionsRequest) returns (ListChargingSessionsResponse);
+  rpc CalculateSessionTariff(CalculateSessionTariffRequest) returns (Tariff);
+  rpc StopChargingSession(StopChargingSessionRequest) returns (ChargingSession);
+}

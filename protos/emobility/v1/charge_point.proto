@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package emobility.v1;
+
+// Verfügbarkeitsstatus einer Ladesäule.
+// 0 = UNSPECIFIED ist der proto3-Default und kennzeichnet "nicht gesetzt".
+enum ChargePointStatus {
+  CHARGE_POINT_STATUS_UNSPECIFIED = 0;
+  CHARGE_POINT_STATUS_AVAILABLE = 1;     // frei, kann reserviert werden
+  CHARGE_POINT_STATUS_OCCUPIED = 2;      // einem Ladevorgang zugeordnet (reserviert/belegt)
+  CHARGE_POINT_STATUS_OUT_OF_ORDER = 3;  // gesperrt / defekt, nicht reservierbar
+}
+
+enum ConnectorType {
+  CONNECTOR_TYPE_UNSPECIFIED = 0;
+  CONNECTOR_TYPE_TYPE2 = 1;    // AC
+  CONNECTOR_TYPE_CCS = 2;      // DC
+  CONNECTOR_TYPE_CHADEMO = 3;  // DC
+}
+
+message ChargePoint {
+  string charge_point_id = 1;      // eindeutige ID, z. B. "cp-001"
+  string station_id = 2;           // Standort, an dem die Säule steht
+  string display_name = 3;
+  ConnectorType connector_type = 4;
+  uint32 max_power_w = 5;          // maximale Ladeleistung in Watt (Ganzzahl, keine Rundungsfehler)
+  ChargePointStatus status = 6;
+  string current_session_id = 7;   // leer, wenn keine Belegung
+}
+
+message GetChargePointRequest {
+  string charge_point_id = 1;
+}
+
+message ListChargePointsRequest {
+  // Filter optional: UNSPECIFIED = alle
+  ChargePointStatus status_filter = 1;
+}
+
+message ListChargePointsResponse {
+  repeated ChargePoint charge_points = 1;
+}
+
+// Reserviert (belegt) eine Ladesäule für genau einen Ladevorgang.
+// Idempotent: wiederholter Aufruf mit derselben session_id liefert dieselbe Belegung.
+message ReserveChargePointRequest {
+  string charge_point_id = 1;
+  string session_id = 2;
+}
+
+message ReleaseChargePointRequest {
+  string charge_point_id = 1;
+  string session_id = 2;  // nur die belegende Session darf freigeben
+}
+
+service ChargePointService {
+  rpc GetChargePoint(GetChargePointRequest) returns (ChargePoint);
+  rpc ListChargePoints(ListChargePointsRequest) returns (ListChargePointsResponse);
+  rpc ReserveChargePoint(ReserveChargePointRequest) returns (ChargePoint);
+  rpc ReleaseChargePoint(ReleaseChargePointRequest) returns (ChargePoint);
+}

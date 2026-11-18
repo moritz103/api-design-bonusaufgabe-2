@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package emobility.v1;
+
+import "google/protobuf/timestamp.proto";
+import "emobility/v1/common.proto";
+import "emobility/v1/tariff.proto";
+
+// Version 2 des Vertrags (abwärtskompatible Weiterentwicklung von Version 1,
+// siehe protos_legacy/ und ENTWURF.md, Abschnitt 2.6).
+
+enum ChargingSessionStatus {
+  CHARGING_SESSION_STATUS_UNSPECIFIED = 0;
+  CHARGING_SESSION_STATUS_PENDING = 1;    // angelegt, Ladesäule reserviert, Tarif ausstehend
+  CHARGING_SESSION_STATUS_ACTIVE = 2;     // Tarif steht fest, Laden läuft
+  CHARGING_SESSION_STATUS_COMPLETED = 3;  // beendet und abgerechnet
+  CHARGING_SESSION_STATUS_FAILED = 4;     // Start fehlgeschlagen (z. B. Tarif-Deadline)
+  CHARGING_SESSION_STATUS_SUSPENDED = 5;  // NEU in v2: pausiert (z. B. Lastmanagement)
+}
+
+message ChargingSession {
+  string session_id = 1;              // vom Provider vergeben ("cs-…")
+  string charge_point_id = 2;
+  ChargingSessionStatus status = 3;
+  Tariff tariff = 4;                  // zugeordneter (berechneter) Tarif
+
+  // v1: string vehicle_plate = 5;  -> entfernt (Datenschutz, wird fachlich nicht benötigt).
+  // Nummer und Name reserviert, damit sie nie wiederverwendet werden.
+  reserved 5;
+  reserved "vehicle_plate";
+
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp ended_at = 7;
+  string id_tag = 8;                  // Autorisierungsmerkmal (RFID-Karte / App-Token)
+  uint64 energy_delivered_wh = 9;     // gesetzt beim Beenden
+  Money total_cost = 10;              // gesetzt beim Beenden
+  string failure_reason = 11;
+  string customer_id = 12;            // NEU in v2: optionale Kunden-ID
+}
+
+message CreateChargingSessionRequest {
+  string charge_point_id = 1;
+  string id_tag = 2;
+  reserved 3;                         // v1: string vehicle_plate = 3;
+  reserved "vehicle_plate";
+  string customer_id = 4;             // NEU in v2
+}
+
+message GetChargingSessionRequest {
+  string session_id = 1;
+}
+
+message ListChargingSessionsRequest {
+  int32 page_size = 1;                // 0 = Default (10), max. 100
+  string page_token = 2;              // opak, aus next_page_token der vorherigen Antwort
+  ChargingSessionStatus status_filter = 3;  // UNSPECIFIED = alle
+}
+
+message ListChargingSessionsResponse {
+  repeated ChargingSession charging_sessions = 1;
+  string next_page_token = 2;         // leer = letzte Seite
+  int32 total_size = 3;
+}
+
+// Ermittelt den aktuell gültigen Tarif beim TariffService und ordnet ihn
+// dem Ladevorgang zu (z. B. nach einer Tarifänderung im Betrieb).
+message CalculateSessionTariffRequest {
+  string session_id = 1;
+}
+
+message StopChargingSessionRequest {
+  string session_id = 1;
+}
+
+service ChargingSessionService {
+  rpc CreateChargingSession(CreateChargingSessionRequest) returns (ChargingSession);
+  rpc GetChargingSession(GetChargingSessionRequest) returns (ChargingSession);
+  rpc ListChargingSessions(ListChargingSessionsRequest) returns (ListChargingSessionsResponse);
+  rpc CalculateSessionTariff(CalculateSessionTariffRequest) returns (Tariff);
+  rpc StopChargingSession(StopChargingSessionRequest) returns (ChargingSession);
+}
